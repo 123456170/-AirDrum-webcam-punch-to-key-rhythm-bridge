@@ -4,6 +4,7 @@ import json
 import math
 import random
 import tempfile
+import inspect
 import threading
 import collections
 from datetime import datetime
@@ -30,8 +31,10 @@ except Exception:
     WebRtcMode = None
 
 try:
-    from streamlit_js_eval import streamlit_js_eval
+    import streamlit_js_eval as _streamlit_js_eval_module
+    streamlit_js_eval = getattr(_streamlit_js_eval_module, "streamlit_js_eval", None)
 except Exception:
+    _streamlit_js_eval_module = None
     streamlit_js_eval = None
 
 import streamlit.components.v1 as components
@@ -48,10 +51,10 @@ QUADRANT_LABELS = ["Top-left", "Top-right", "Bottom-left", "Bottom-right"]
 DEFAULT_THRESHOLD_PX_S = 1300.0
 DEFAULT_COOLDOWN_MS = 135
 CALIBRATION_SECONDS = 10.0
+DEMO_VIDEO_SECONDS = 40
 
 
 def auto_refresh_fragment(run_every):
-    """Compatibility wrapper for Streamlit fragments."""
     if hasattr(st, "fragment"):
         return st.fragment(run_every=run_every)
     if hasattr(st, "experimental_fragment"):
@@ -139,6 +142,19 @@ def draw_fake_hand(img, center, label, velocity, threshold):
     cv2.putText(img, text, (cx - 55, cy + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1, cv2.LINE_AA)
 
 
+class FakeClock:
+    """Deterministic clock used for offline video rendering."""
+
+    def __init__(self, start=0.0):
+        self.t = float(start)
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += float(dt)
+
+
 class HitLogger:
     def __init__(self, maxlen=5000):
         self.lock = threading.RLock()
@@ -194,6 +210,8 @@ class PunchPipeline:
     def __init__(self):
         self.lock = threading.RLock()
         self.logger = HitLogger()
+
+        self.clock = time.perf_counter
 
         self.start_time = time.time()
         self.bpm = 112.0
@@ -252,7 +270,7 @@ class PunchPipeline:
     def start_calibration(self):
         with self.lock:
             self.calibrating = True
-            self.calib_start = time.perf_counter()
+            self.calib_start = self.clock()
             self.calib_speeds = []
             self.calib_positions = []
             self.calib_message = "Calibration started: punch naturally for 10 seconds."
@@ -331,7 +349,7 @@ class PunchPipeline:
         if quadrant not in (0, 1, 2, 3):
             return None
 
-        now = time.perf_counter()
+        now = self.clock()
         wall = time.time()
 
         with self.lock:
@@ -378,9 +396,9 @@ class PunchPipeline:
 
     def process_bgr(self, img_bgr, frame_time=None):
         h, w = img_bgr.shape[:2]
-        arrival = frame_time if frame_time is not None else time.perf_counter()
+        arrival = frame_time if frame_time is not None else self.clock()
         annotated = img_bgr.copy()
-        now = time.perf_counter()
+        now = self.clock()
 
         self.ensure_hands()
         hand_infos = []
@@ -487,10 +505,13 @@ class PunchPipeline:
 
 
 class DemoSimulator:
-    def __init__(self, pipeline):
+    def __init__(self, pipeline, clock=None, cycle_length=120.0):
         self.pipeline = pipeline
+        self.clock = clock or time.perf_counter
+        self.cycle_length = float(cycle_length)
+
         self.w, self.h = 640, 480
-        self.start = time.perf_counter()
+        self.start = self.clock()
         self.last = self.start
 
         self.positions = {
@@ -500,27 +521,25 @@ class DemoSimulator:
         self.targets = {k: v.copy() for k, v in self.positions.items()}
         self.display_vel = {"Left": 0.0, "Right": 0.0}
 
-        self.next_event_cycle = 16.0
+        self.next_event_cycle = 0.125 * self.cycle_length + 1.2
         self.slow_seq = [0, 1, 2, 3, 0, 2, 1, 3]
         self.slow_idx = 0
         self.last_phase = None
 
     def step(self):
-        now = time.perf_counter()
+        now = self.clock()
         dt = max(0.008, min(0.08, now - self.last))
         self.last = now
 
         t = now - self.start
-        cycle = t % 120.0
+        cycle = t % self.cycle_length
+        L = self.cycle_length
 
-        img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
-        img[:] = (22, 20, 34)
-
-        if cycle < 15:
+        if cycle < 0.125 * L:
             phase = "Calibration warm-up"
-        elif cycle < 45:
+        elif cycle < 0.375 * L:
             phase = "Slow deliberate punches"
-        elif cycle < 90:
+        elif cycle < 0.75 * L:
             phase = "Fast gameplay"
         else:
             phase = "Near-miss / edge cases"
@@ -591,6 +610,9 @@ class DemoSimulator:
                 actual_v = float(np.linalg.norm(self.positions[hand] - prev_pos) / dt)
                 self.display_vel[hand] = max(actual_v, self.display_vel[hand] * 0.88)
 
+        img = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        img[:] = (22, 20, 34)
+
         img = draw_grid(img, self.pipeline.flash, now)
 
         if phase == "Calibration warm-up":
@@ -606,7 +628,7 @@ class DemoSimulator:
             f"Threshold {int(self.pipeline.threshold_px_s)} px/s | Cooldown {int(self.pipeline.cooldown_ms)} ms | BPM {int(self.pipeline.bpm)}",
             (10, 42),
         )
-        draw_badge(img, f"Demo phase: {phase} | {cycle:05.1f}s / 120s", (10, 74))
+        draw_badge(img, f"Demo phase: {phase} | {cycle:05.1f}s / {int(L)}s", (10, 74))
 
         if self.pipeline.calibrating:
             draw_badge(img, "Live calibration armed (use webcam mode for real hand tracking)", (10, 106))
@@ -729,15 +751,31 @@ function hitLane(laneIdx, key, source) {
   } catch (e) {}
 }
 
-window.addEventListener('message', (e) => {
-  if (!e.data) return;
+function handleBridgePayload(payload) {
+  if (!payload) return;
 
-  if (e.data.type === 'drum-hit') {
-    hitLane(e.data.lane || 0, e.data.key || 'D', e.data.source || 'external');
+  if (payload.type === 'drum-hit') {
+    hitLane(payload.lane || 0, payload.key || 'D', payload.source || 'external');
   }
 
-  if (e.data.type === 'drum-hit-batch' && Array.isArray(e.data.hits)) {
-    e.data.hits.forEach(h => hitLane(h.lane || 0, h.key || 'D', h.source || 'gesture'));
+  if (payload.type === 'drum-hit-batch' && Array.isArray(payload.hits)) {
+    payload.hits.forEach(h => hitLane(h.lane || 0, h.key || 'D', h.source || 'gesture'));
+  }
+}
+
+window.addEventListener('message', (e) => handleBridgePayload(e.data));
+
+try {
+  const bridgeChannel = new BroadcastChannel('airdrum_hits');
+  bridgeChannel.onmessage = (e) => handleBridgePayload(e.data);
+} catch (e) {}
+
+window.addEventListener('storage', (e) => {
+  if (e.key === 'airdrum_hits') {
+    try {
+      const parsed = JSON.parse(e.newValue);
+      handleBridgePayload(parsed.payload || parsed);
+    } catch (err) {}
   }
 });
 
@@ -822,11 +860,11 @@ def render_game(bpm):
     components.html(html, height=470, scrolling=False)
 
 
-def build_dispatch_js(hits):
-    payload = json.dumps({"type": "drum-hit-batch", "hits": hits})
+def build_dispatch_js_from_payload(payload):
+    payload_json = json.dumps(payload)
     return f"""
     (function() {{
-      const payload = {payload};
+      const payload = {payload_json};
 
       try {{
         document.querySelectorAll('iframe').forEach(function(frame) {{
@@ -850,14 +888,181 @@ def build_dispatch_js(hits):
     """
 
 
+def build_hidden_dispatcher_html(payload):
+    payload_json = json.dumps(payload)
+    return f"""
+<html>
+<body style="margin:0;padding:0;background:transparent;">
+<script>
+(function() {{
+  const payload = {payload_json};
+
+  try {{
+    const bc = new BroadcastChannel('airdrum_hits');
+    bc.postMessage(payload);
+    bc.close();
+  }} catch (e) {{}}
+
+  try {{
+    localStorage.setItem('airdrum_hits', JSON.stringify({{nonce: Date.now(), payload: payload}}));
+  }} catch (e) {{}}
+
+  try {{
+    if (window.parent && window.parent !== window) {{
+      window.parent.postMessage(payload, '*');
+    }}
+  }} catch (e) {{}}
+
+  try {{
+    payload.hits.forEach(function(h) {{
+      const key = (h.key || 'd').toLowerCase();
+      const opts = {{key: key, bubbles: true, cancelable: true}};
+      document.dispatchEvent(new KeyboardEvent('keydown', opts));
+      document.dispatchEvent(new KeyboardEvent('keyup', opts));
+    }});
+  }} catch (e) {{}}
+}})();
+</script>
+</body>
+</html>
+"""
+
+
+@st.cache_resource
+def get_js_eval_component():
+    objects = []
+
+    if streamlit_js_eval is not None:
+        objects.append(streamlit_js_eval)
+        try:
+            objects.extend(getattr(streamlit_js_eval, "__globals__", {}).values())
+        except Exception:
+            pass
+
+    if _streamlit_js_eval_module is not None:
+        try:
+            objects.extend(vars(_streamlit_js_eval_module).values())
+        except Exception:
+            pass
+
+    for obj in objects:
+        if type(obj).__name__ == "CustomComponent":
+            return obj
+
+    return None
+
+
+@st.cache_resource
+def get_js_eval_label():
+    labels = ["js_code", "js", "code", "expression", "script"]
+    texts = []
+
+    for target in (streamlit_js_eval, _streamlit_js_eval_module):
+        if target is None:
+            continue
+        try:
+            texts.append(inspect.getsource(target))
+        except Exception:
+            pass
+
+    text = "\n".join(texts)
+
+    for label in labels:
+        if f"{label}=" in text:
+            return label
+
+    return "js_code"
+
+
+def dispatch_hits(hits):
+    if not hits:
+        return
+
+    payload = {
+        "type": "drum-hit-batch",
+        "hits": hits,
+    }
+
+    js = build_dispatch_js_from_payload(payload)
+    key = f"airdrum_js_{int(time.time() * 1000)}_{random.randint(0, 999999)}"
+
+    comp = get_js_eval_component()
+    preferred_label = get_js_eval_label()
+
+    candidate_labels = [preferred_label] + [
+        x for x in ["js_code", "js", "code", "expression", "script"] if x != preferred_label
+    ]
+
+    if comp is not None:
+        try:
+            kwargs = {label: js for label in candidate_labels}
+            kwargs["key"] = key
+            comp(**kwargs)
+            return
+        except Exception:
+            pass
+
+    if streamlit_js_eval is not None:
+        for label in candidate_labels:
+            try:
+                streamlit_js_eval(**{label: js, "key": key})
+                return
+            except Exception:
+                pass
+
+    components.html(build_hidden_dispatcher_html(payload), height=0, width=0)
+
+
 @st.cache_resource
 def get_pipeline():
     return PunchPipeline()
 
 
-@st.cache_resource
 def get_demo_sim():
-    return DemoSimulator(get_pipeline())
+    cycle = float(st.session_state.get("demo_record_seconds", DEMO_VIDEO_SECONDS))
+    key = f"demo_sim_{cycle:.1f}"
+    if key not in st.session_state:
+        st.session_state[key] = DemoSimulator(get_pipeline(), cycle_length=cycle)
+    return st.session_state[key]
+
+
+def render_offline_demo_video(seconds=DEMO_VIDEO_SECONDS, fps=24, w=640, h=480, progress=None):
+    """Render a fully annotated demo session to MP4 offline (fast, deterministic)."""
+    live = get_pipeline()
+
+    offline_pipeline = PunchPipeline()
+    offline_pipeline.bpm = live.bpm
+    offline_pipeline.cooldown_ms = live.cooldown_ms
+    offline_pipeline.threshold_px_s = live.threshold_px_s
+
+    clock = FakeClock(0.0)
+    offline_pipeline.clock = clock
+
+    sim = DemoSimulator(offline_pipeline, clock=clock, cycle_length=float(seconds))
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(tempfile.gettempdir(), f"airdrum_demo_{int(seconds)}s_{stamp}.mp4")
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(w), int(h)))
+
+    if not writer.isOpened():
+        path = os.path.join(tempfile.gettempdir(), f"airdrum_demo_{int(seconds)}s_{stamp}.avi")
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), fps, (int(w), int(h)))
+
+    total = int(seconds * fps)
+
+    for i in range(total):
+        clock.advance(1.0 / fps)
+        img = sim.step()
+        writer.write(img)
+
+        if progress is not None and i % 12 == 0:
+            progress.progress((i + 1) / total)
+
+    if progress is not None:
+        progress.progress(1.0)
+
+    writer.release()
+    return path
 
 
 def video_frame_callback(frame):
@@ -898,11 +1103,13 @@ def demo_view():
 
     img = sim.step()
 
+    demo_seconds = float(st.session_state.get("demo_record_seconds", DEMO_VIDEO_SECONDS))
+
     if (
         pipeline.recording
         and st.session_state.get("auto_record_demo", False)
         and pipeline.record_start is not None
-        and time.time() - pipeline.record_start > 120.0
+        and time.time() - pipeline.record_start > demo_seconds
         and not st.session_state.get("demo_record_done", False)
     ):
         path = pipeline.stop_recording()
@@ -915,7 +1122,7 @@ def demo_view():
         except Exception:
             st.session_state.video_bytes = None
 
-    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
+    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width="stretch")
 
 
 @auto_refresh_fragment(run_every=0.10)
@@ -939,8 +1146,8 @@ def live_bridge():
                 }
             )
 
-        if streamlit_js_eval is not None and hits:
-            streamlit_js_eval(build_dispatch_js(hits))
+        if hits:
+            dispatch_hits(hits)
 
     events_df = pipeline.logger.df()
     latencies = list(pipeline.logger.latencies)
@@ -959,12 +1166,9 @@ def live_bridge():
     else:
         c3.metric("Last beat error", "--")
 
-    if streamlit_js_eval is None:
-        st.warning("streamlit-js-eval is not active. Hits will be logged, but JS dispatch may not work.")
-
     if len(events_df):
         display_df = events_df.drop(columns=["wall_time"], errors="ignore")
-        st.dataframe(display_df.sort_values("id", ascending=False).head(8), use_container_width=True)
+        st.dataframe(display_df.sort_values("id", ascending=False).head(8), width="stretch")
     else:
         st.info("No hits yet. Punch a quadrant or use the manual pads.")
 
@@ -1011,19 +1215,31 @@ def downloads_panel():
         mime="text/csv",
     )
 
+    rendered_bytes = st.session_state.get("rendered_video_bytes")
+    if rendered_bytes:
+        seconds = st.session_state.get("rendered_video_seconds", DEMO_VIDEO_SECONDS)
+        fname = os.path.basename(st.session_state.get("rendered_video_path") or f"airdrum_demo_{seconds}s.mp4")
+        mime = "video/mp4" if fname.endswith(".mp4") else "video/avi"
+        st.download_button(
+            f"Download {int(seconds)}s demo video",
+            data=rendered_bytes,
+            file_name=fname,
+            mime=mime,
+        )
+
     video_path = st.session_state.get("video_path") or pipeline.video_path
     video_bytes = st.session_state.get("video_bytes")
 
     if video_bytes and video_path and not pipeline.recording:
         mime = "video/mp4" if video_path.endswith(".mp4") else "video/avi"
         st.download_button(
-            "Download session video",
+            "Download live session video",
             data=video_bytes,
             file_name=os.path.basename(video_path),
             mime=mime,
         )
     else:
-        st.caption("Stop recording to enable video download.")
+        st.caption("Stop recording to enable live session video download.")
 
 
 def manual_pads():
@@ -1046,7 +1262,7 @@ def manual_pads():
 st.title("🥁 AirDrum: webcam punch-to-key rhythm bridge")
 st.caption(
     "Four quadrant drum pads + MediaPipe hand velocity detection + low-latency browser JS key dispatch. "
-    "Instant demo starts automatically. Switch to live webcam mode for real-camera tracking."
+    "Instant demo starts automatically. Use the sidebar to render a 40-second downloadable demo video."
 )
 
 pipeline = get_pipeline()
@@ -1071,6 +1287,27 @@ manual_threshold = st.sidebar.slider(
     disabled=auto_threshold,
 )
 
+demo_video_seconds = st.sidebar.slider(
+    "Demo video length (seconds)",
+    10,
+    120,
+    DEMO_VIDEO_SECONDS,
+    help="Length of the auto-recorded demo and the offline rendered demo video.",
+)
+
+if st.sidebar.button("Render demo video for download"):
+    prog = st.sidebar.progress(0.0, text="Rendering annotated demo video...")
+    rendered_path = render_offline_demo_video(seconds=int(demo_video_seconds), progress=prog)
+    prog.progress(1.0, text="Render complete.")
+
+    try:
+        with open(rendered_path, "rb") as f:
+            st.session_state.rendered_video_bytes = f.read()
+        st.session_state.rendered_video_path = rendered_path
+        st.session_state.rendered_video_seconds = int(demo_video_seconds)
+    except Exception:
+        st.session_state.rendered_video_bytes = None
+
 st.sidebar.caption("Live calibration measures punch speed for 10 seconds and auto-tunes the threshold.")
 
 if st.sidebar.button("Start 10s calibration"):
@@ -1082,10 +1319,14 @@ if st.sidebar.button("Start 10s calibration"):
 
 if st.sidebar.button("Reset session"):
     pipeline.reset_state()
-    get_demo_sim.clear()
+    for k in list(st.session_state.keys()):
+        if k.startswith("demo_sim_"):
+            del st.session_state[k]
     st.session_state.video_path = None
     st.session_state.video_bytes = None
     st.session_state.demo_record_done = False
+    st.session_state.rendered_video_bytes = None
+    st.session_state.rendered_video_path = None
     st.rerun()
 
 st.sidebar.markdown("---")
@@ -1112,7 +1353,7 @@ if st.sidebar.button(record_label):
         else:
             pipeline.arm_recording()
 
-auto_record_demo = st.sidebar.checkbox("Auto-record first 2-minute demo", value=True)
+auto_record_demo = st.sidebar.checkbox("Auto-record demo", value=True)
 
 st.sidebar.markdown("---")
 
@@ -1126,6 +1367,7 @@ with st.sidebar:
 
 st.session_state.bpm = bpm
 st.session_state.auto_record_demo = auto_record_demo
+st.session_state.demo_record_seconds = demo_video_seconds
 
 if "video_path" not in st.session_state:
     st.session_state.video_path = None
@@ -1135,6 +1377,15 @@ if "video_bytes" not in st.session_state:
 
 if "demo_record_done" not in st.session_state:
     st.session_state.demo_record_done = False
+
+if "rendered_video_bytes" not in st.session_state:
+    st.session_state.rendered_video_bytes = None
+
+if "rendered_video_path" not in st.session_state:
+    st.session_state.rendered_video_path = None
+
+if "rendered_video_seconds" not in st.session_state:
+    st.session_state.rendered_video_seconds = DEMO_VIDEO_SECONDS
 
 pipeline.configure(
     bpm=bpm,
